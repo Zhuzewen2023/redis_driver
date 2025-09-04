@@ -1,5 +1,7 @@
 #include "reactor.h"
 
+static int _write_socket(event_t* e, void* buf, int size);
+
 reactor_t* create_reactor()
 {
 	reactor_t* r = (reactor_t*)malloc(sizeof(reactor_t));
@@ -25,25 +27,46 @@ static event_t* _get_event_t(reactor_t* r)
 	r->iter++;
 	while (r->events[r->iter & MAX_CONN].fd > 0) { 
 		r->iter++;
+		if (r->iter >= MAX_CONN) {
+			break;
+		}
 	}
 	return &r->events[r->iter];
 }
 
-event_t* new_event(reactor_t* r, int fd, event_callback_fn rd, event_callback_fn wt, event_callback_fn err)
+event_t* new_event(reactor_t* r, int fd, event_callback_fn rd, event_callback_fn wt, error_callback_fn err)
 {
 	assert(rd || wt || err);
 	event_t* e = _get_event_t(r);
 	e->r = r;
 	e->fd = fd;
+	e->in = buffer_new(16 * 1024);
+	e->out = buffer_new(16 * 1024);
 	e->read_fn = rd;
 	e->write_fn = wt;
 	e->error_fn = err;
 	return e;
 }
 
+buffer_t* evbuf_in(event_t* e)
+{
+	return e->in;
+}
+
+buffer_t* evbuf_out(event_t* e)
+{
+	return e->out;
+}
+
+reactor_t* event_base(event_t* e)
+{
+	return e->r;
+}
+
 void free_event(event_t* e)
 {
-	
+	buffer_free(e->in);
+	buffer_free(e->out);
 }
 
 int set_nonblock(int fd)
@@ -66,7 +89,7 @@ int add_event(reactor_t* r, int events, event_t* e)
 
 int del_event(reactor_t* r, event_t* e)
 {
-	epoll_crl(r->epfd, EPOLL_CTL_DEL, e->fd, NULL);
+	epoll_ctl(r->epfd, EPOLL_CTL_DEL, e->fd, NULL);
 	free_event(e);
 	return 0;
 }
@@ -74,7 +97,7 @@ int del_event(reactor_t* r, event_t* e)
 int enable_event(reactor_t* r, event_t* e, int readable, int writeable)
 {
 	struct epoll_event ev;
-	ev.events = (readable ? EPOLLIN : 0) | (writable ? EPOLLOUT : 0);
+	ev.events = (readable ? EPOLLIN : 0) | (writeable ? EPOLLOUT : 0);
 	ev.data.ptr = e;
 	if (epoll_ctl(r->epfd, EPOLL_CTL_MOD, e->fd, &ev) == -1) {
 		return -1;
@@ -97,8 +120,22 @@ void eventloop_once(reactor_t* r, int timeout)
 			}
 		}
 		if (mask & EPOLLOUT) {
-			if (er->write_fn) {
+			if (et->write_fn) {
 				et->write_fn(et->fd, EPOLLOUT, et);
+			}
+			else {
+				buffer_t* out = evbuf_out(et);
+				if (buffer_len(out) > 0) {
+					uint8_t* buf = buffer_write_atmost(out);
+					int len = buffer_len(out);
+					int n = _write_socket(et, buf, len);
+					if (n > 0) {
+						buffer_drain(out, n);
+						if (buffer_len(out) == 0) {
+							enable_event(et->r, et, 1, 0);
+						}
+					}
+				}
 			}
 		}
 	}
@@ -156,7 +193,7 @@ int create_server(reactor_t* r, short port, event_callback_fn func)
 	event_t* e = new_event(r, listenfd, func, NULL, NULL);
 	add_event(r, EPOLLIN, e);
 
-	printf("listen port : %d\n", port);
+	printf("listen port : %d\n", ntohs(port));
 	return 0;
 }
 
@@ -185,7 +222,7 @@ int event_buffer_read(event_t* e)
 			}
 			printf("read error fd = %d err = %s\n", fd, strerror(errno));
 			if (e->error_fn) {
-				e->error_fn(fd, strerr(errno));
+				e->error_fn(fd, strerror(errno));
 			}
 			del_event(e->r, e);
 			close(fd);
@@ -193,7 +230,7 @@ int event_buffer_read(event_t* e)
 		}
 		else {
 			printf("recv data from client:%s", buf);
-			//buffer_add(evbuf_in(e), buf, n);
+			buffer_add(evbuf_in(e), buf, n);
 		}
 		num += n;
 	}
@@ -213,7 +250,7 @@ static int _write_socket(event_t* e, void* buf, int size)
 				break;
 			}
 			if (e->error_fn) {
-				e->error_fn(fd, strerr(errno));
+				e->error_fn(fd, strerror(errno));
 			}
 			del_event(e->r, e);
 			close(e->fd);
@@ -224,19 +261,19 @@ static int _write_socket(event_t* e, void* buf, int size)
 }
 
 int event_buffer_write(event_t* e, void* buf, int sz) {
-	//buffer_t* out = evbuf_out(e);
-	//if (buffer_len(buf) == 0) {
-		//int n = _write_socket(e, buf, sz);
-		//if (n == 0 || n < sz) {
-			// 发送失败，除了将没有发送出去的数据写入缓冲区，还要注册写事件
-			//buffer_add(out, (char*)buf + n, sz - n);
-			//enable_event(e->r, e, 1, 1);
-			//return 0;
-		//}
-		//else if (n < 0)
-			//return 0;
-		//return 1;
-	//}
-	//buffer_add(out, (char*)buf, sz);
+	buffer_t* out = evbuf_out(e);
+	if (buffer_len(out) == 0) {
+		int n = _write_socket(e, buf, sz);
+		if (n == 0 || n < sz) {
+			buffer_add(out, (char*)buf + n, sz - n);
+			enable_event(e->r, e, 1, 1);
+			return 0;
+		}
+		else if (n < 0) {
+			return 0;
+		}
+		return 1;
+	}
+	buffer_add(out, (char*)buf, sz);
 	return 1;
 }
