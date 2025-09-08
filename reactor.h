@@ -33,6 +33,7 @@ struct event_s
 	event_callback_fn read_fn;
 	event_callback_fn write_fn;
 	error_callback_fn error_fn;
+	void* priv;
 };
 
 struct reactor_s

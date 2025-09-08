@@ -65,6 +65,7 @@ reactor_t* event_base(event_t* e)
 
 void free_event(event_t* e)
 {
+	e->fd = 0;
 	buffer_free(e->in);
 	buffer_free(e->out);
 }
